@@ -1,3 +1,4 @@
+import time
 from ddgs import DDGS
 from google import genai
 import streamlit as st
@@ -10,10 +11,9 @@ st.set_page_config(
 
 st.title("🏷️ Real-Time Price Comparison Agent")
 st.caption(
-    "Powered by Gemini 3.8 Flash + Live Web Search (Zero-Cost Free Tier)"
+    "Powered by Gemini 3.5 Flash-Lite + Live Web Search (Zero-Cost Free Tier)"
 )
 
-# Retrieve API key securely from Streamlit Cloud Secrets, or fall back to sidebar input
 api_key = (
     st.secrets.get("GEMINI_API_KEY")
     if "GEMINI_API_KEY" in st.secrets
@@ -32,7 +32,7 @@ if st.button("Find Lowest Price", type="primary"):
   else:
     with st.spinner("Agent is querying live web listings..."):
       try:
-        # Step 1: Query live search snippets across Indian retailers without API limits
+        # Step 1: Query live search snippets across Indian retailers
         search_query = f"{product} price in India Amazon.in Flipkart Croma"
         with DDGS() as ddgs:
           raw_results = list(
@@ -48,7 +48,6 @@ if st.button("Find Lowest Price", type="primary"):
         if not search_context.strip():
           st.warning("No search results found. Try a different product name.")
         else:
-          # Step 2: Use Gemini to compare listings, extract prices, and calculate savings
           client = genai.Client(api_key=api_key)
 
           prompt = f"""
@@ -67,12 +66,32 @@ if st.button("Find Lowest Price", type="primary"):
                     5. Provide a direct, concise purchase recommendation highlighting the lowest-cost option.
                     """
 
-          response = client.models.generate_content(
-              model="gemini-3.8-flash",
-              contents=prompt,
-          )
+          # Step 2: Fallback handling across available lightweight models
+          models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+          response = None
 
-          st.markdown(response.text)
+          for model_name in models_to_try:
+            try:
+              response = client.models.generate_content(
+                  model=model_name,
+                  contents=prompt,
+              )
+              if response and response.text:
+                break
+            except Exception as model_err:
+              if "503" in str(model_err) or "UNAVAILABLE" in str(model_err):
+                time.sleep(1)
+                continue
+              else:
+                raise model_err
+
+          if response and response.text:
+            st.markdown(response.text)
+          else:
+            st.error(
+                "Google servers are experiencing peak congestion. Please try"
+                " again in a few moments."
+            )
 
       except Exception as e:
         st.error(f"Error fetching prices: {e}")
