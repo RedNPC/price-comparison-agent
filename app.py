@@ -30,7 +30,6 @@ if st.button("Find Lowest Price", type="primary"):
   else:
     with st.spinner("Scanning Indian retail listings and analyzing prices..."):
       try:
-        # Step 1: Single natural-language query (avoids punctuation bugs & IP rate limits)
         search_context = ""
         try:
           query = (
@@ -46,10 +45,8 @@ if st.button("Find Lowest Price", type="primary"):
                 for r in results
             ])
         except Exception:
-          # If Streamlit's shared cloud IP is temporarily rate-limited by DDGS, proceed seamlessly
           search_context = ""
 
-        # Step 2: Query Gemini (never block the user with a 'No data found' dead end)
         client = genai.Client(api_key=api_key)
 
         prompt = f"""
@@ -63,10 +60,17 @@ if st.button("Find Lowest Price", type="primary"):
                 1. Identify the main variants if the query is broad (e.g., for PlayStation 5, separate PS5 Slim Digital Edition vs. PS5 Slim Disc Standard Edition).
                 2. Extract the exact numerical price in INR (₹) for Amazon.in, Flipkart, Croma, and other Indian retailers from the snippets.
                 3. NEVER write "Check Site" in the price column. Always provide the numeric price in ₹ (if a store's live snippet only shows a category link, provide its current standard Indian retail listing price and mark it with an asterisk *).
-                4. Calculate the exact Rupee savings between the cheapest and most expensive listing.
-                5. Output a clean Markdown comparison table:
-                   | Model / Variant | Retailer | Listed Price (₹) | Availability |
-                6. Finish with a bold 2-sentence 'Bottom-Line Verdict' naming the cheapest place to buy right now.
+                4. Output a clean Markdown comparison table with 5 columns:
+                   | Model / Variant | Retailer | Listed Price (₹) | Availability | Store Link |
+                5. For the 'Store Link' column, format every entry as a clickable Markdown link like [Buy on Amazon](URL):
+                   - If a matching URL is present in the LIVE WEB SEARCH SNIPPETS above, use that exact URL.
+                   - If no exact URL is in the snippets for that store, construct a working search link by replacing spaces in the model name with '+' using these exact templates:
+                     * Amazon.in: https://www.amazon.in/s?k=MODEL+NAME
+                     * Flipkart: https://www.flipkart.com/search?q=MODEL+NAME
+                     * Croma: https://www.croma.com/searchB?q=MODEL+NAME
+                     * Reliance Digital: https://www.reliancedigital.in/search?q=MODEL+NAME
+                   - Never invent fake product URLs.
+                6. Finish with a bold 2-sentence 'Bottom-Line Verdict' naming the cheapest place to buy right now and the exact Rupee savings.
                 """
 
         models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
