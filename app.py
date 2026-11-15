@@ -71,7 +71,7 @@ def fetch_60_day_availability(user_prompt, client):
     and "arguments" (matching that tool's inputSchema). Do not wrap in markdown fences.
     """
     plan_resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=planner_prompt,
     )
     cleaned_json = plan_resp.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -120,7 +120,7 @@ if st.button("Search 60-Day Award Seats", type="primary"):
                 {json.dumps(raw_mcp_data)}
                 """
                 final_output = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.8-flash",
                     contents=format_prompt,
                 )
                 st.markdown(final_output.text)
@@ -129,4 +129,3 @@ if st.button("Search 60-Day Award Seats", type="primary"):
                     st.json(raw_mcp_data)
             except Exception as e:
                 st.error(f"Error fetching availability: {e}")
-    
