@@ -1,50 +1,78 @@
-import streamlit as st
+from ddgs import DDGS
 from google import genai
-from google.genai import types
+import streamlit as st
 
-st.set_page_config(page_title="Retail Price Intelligence Agent", page_icon="🏷️", layout="centered")
+st.set_page_config(
+    page_title="Retail Price Intelligence Agent",
+    page_icon="🏷️",
+    layout="centered",
+)
 
 st.title("🏷️ Real-Time Price Comparison Agent")
-st.caption("Powered by Gemini 3.8 Flash + Live Google Search Grounding")
+st.caption(
+    "Powered by Gemini 3.8 Flash + Live Web Search (Zero-Cost Free Tier)"
+)
 
 # Retrieve API key securely from Streamlit Cloud Secrets, or fall back to sidebar input
-api_key = st.secrets.get("GEMINI_API_KEY") if "GEMINI_API_KEY" in st.secrets else st.sidebar.text_input("Enter Gemini API Key", type="password")
+api_key = (
+    st.secrets.get("GEMINI_API_KEY")
+    if "GEMINI_API_KEY" in st.secrets
+    else st.sidebar.text_input("Enter Gemini API Key", type="password")
+)
 
-product = st.text_input("Enter product name (e.g., Xbox Series X 1TB, Sony WH-1000XM5):")
+product = st.text_input(
+    "Enter product name (e.g., Xbox Series X 1TB, Sony WH-1000XM5):"
+)
 
 if st.button("Find Lowest Price", type="primary"):
-    if not api_key:
-        st.error("Please provide a Gemini API Key to run the agent.")
-    elif not product.strip():
-        st.warning("Please enter a product name.")
-    else:
-        with st.spinner("Agent is searching Amazon, Flipkart, and other retailers..."):
-            try:
-                client = genai.Client(api_key=api_key)
+  if not api_key:
+    st.error("Please provide a Gemini API Key to run the agent.")
+  elif not product.strip():
+    st.warning("Please enter a product name.")
+  else:
+    with st.spinner("Agent is querying live web listings..."):
+      try:
+        # Step 1: Query live search snippets across Indian retailers without API limits
+        search_query = f"{product} price in India Amazon.in Flipkart Croma"
+        with DDGS() as ddgs:
+          raw_results = list(
+              ddgs.text(search_query, region="in-en", max_results=8)
+          )
 
-                prompt = f"""
-                You are a procurement and price intelligence agent.
-                The user wants to find current prices in India (in INR / ₹) for: "{product}".
+        search_context = "\n\n".join([
+            f"Title: {r.get('title')}\nSnippet: {r.get('body')}\nURL:"
+            f" {r.get('href')}"
+            for r in raw_results
+        ])
 
-                Instructions:
-                1. If the input is specific (e.g., "Xbox Series X 1TB"), search Amazon.in, Flipkart, and major Indian electronics retailers, then compare live face-value listed prices (excluding card discounts) for that exact model.
-                2. If the input is broad (e.g., "PlayStation 5" or "Xbox"), identify the main current retail variants (e.g., Disc vs. Digital Edition, or Series X vs. Series S) and compare each variant separately across platforms so you never mix different models.
-                3. Calculate the price variance/savings between the highest and lowest retailer for each model.
-                4. Output a clean Markdown table:
-                   | Model / Variant | Platform | Listed Price (₹) | In Stock? |
-                5. Provide a concise purchase recommendation highlighting the lowest-cost vendor.
-                """
+        if not search_context.strip():
+          st.warning("No search results found. Try a different product name.")
+        else:
+          # Step 2: Use Gemini to compare listings, extract prices, and calculate savings
+          client = genai.Client(api_key=api_key)
 
-                response = client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        tools=[types.Tool(google_search=types.GoogleSearch())],
-                        temperature=0.2,
-                    ),
-                )
+          prompt = f"""
+                    You are a procurement and price intelligence agent.
+                    Below are live search results from Indian retail sites for the product: "{product}".
 
-                st.markdown(response.text)
+                    LIVE SEARCH RESULTS:
+                    {search_context}
 
-            except Exception as e:
-                st.error(f"Error fetching prices: {e}")
+                    INSTRUCTIONS:
+                    1. Extract the current standard face-value listed price (in INR / ₹) on Amazon.in, Flipkart, and other retailers. Ignore card/bank discounts.
+                    2. If the user query is broad (e.g., "PlayStation 5" or "Xbox"), identify the separate variants (e.g., Disc vs Digital Edition) and group them so you do not compare different models.
+                    3. Calculate the variance/savings between the highest and lowest price found.
+                    4. Output a clean Markdown table:
+                       | Variant / Model | Retailer | Listed Price (₹) | In Stock? | Source Link |
+                    5. Provide a direct, concise purchase recommendation highlighting the lowest-cost option.
+                    """
+
+          response = client.models.generate_content(
+              model="gemini-3.8-flash",
+              contents=prompt,
+          )
+
+          st.markdown(response.text)
+
+      except Exception as e:
+        st.error(f"Error fetching prices: {e}")
