@@ -54,6 +54,68 @@ def mcp_post(http_session, method, params=None, session_id=None, req_id=None):
     )
     return resp.status_code, parse_mcp_response(resp), new_session_id
 
+def pick_route_search_tool(tools):
+    """Finds the tool that accepts origin/destination airport codes (and NOT a flight reference ID)."""
+    scored_tools = []
+    for t in tools:
+        name = t.get("name", "").lower()
+        desc = t.get("description", "").lower()
+        schema = t.get("inputSchema", {})
+        props = {k.lower(): v for k, v in schema.get("properties", {}).items()}
+        required = [r.lower() for r in schema.get("required", [])]
+
+        # Skip tools that require a specific flight/trip/availability reference ID
+        if any(bad in r for r in required for bad in ["id", "ref", "trip"]):
+            continue
+        # Skip live search or alert tools (Pro/Commercial only)
+        if "live" in name or "alert" in name or "refresh" in name:
+            continue
+
+        score = 0
+        if any("origin" in p or "departure" in p or "from" in p for p in props):
+            score += 5
+        if any("dest" in p or "arrival" in p or "to" in p for p in props):
+            score += 5
+        if "search" in name or "cached" in name or "avail" in name:
+            score += 3
+        if "search" in desc or "cached" in desc:
+            score += 1
+
+        scored_tools.append((score, t))
+
+    scored_tools.sort(key=lambda x: x[0], reverse=True)
+    return scored_tools[0][1] if scored_tools else tools[0]
+
+def build_tool_arguments(tool, origin, destination, cabin, start_date_str, end_date_str):
+    """Maps user inputs onto the exact property names and types defined in the tool's JSON schema."""
+    schema = tool.get("inputSchema", {})
+    props = schema.get("properties", {})
+    args = {}
+
+    for prop_name, prop_def in props.items():
+        p_low = prop_name.lower()
+        prop_type = prop_def.get("type", "string")
+
+        def format_val(val):
+            if prop_type == "array":
+                return [x.strip() for x in val.split(",") if x.strip()]
+            return val
+
+        if any(k in p_low for k in ["origin", "from_airport", "departure_airport", "origins"]) and "region" not in p_low:
+            args[prop_name] = format_val(origin)
+        elif any(k in p_low for k in ["dest", "to_airport", "arrival_airport", "destinations"]) and "region" not in p_low:
+            args[prop_name] = format_val(destination)
+        elif any(k in p_low for k in ["start_date", "startdate", "date_from", "from_date", "departure_date"]):
+            args[prop_name] = start_date_str
+        elif any(k in p_low for k in ["end_date", "enddate", "date_to", "to_date"]):
+            args[prop_name] = end_date_str
+        elif "date" == p_low:
+            args[prop_name] = start_date_str
+        elif "cabin" in p_low and cabin != "Any":
+            args[prop_name] = format_val(cabin)
+
+    return args
+
 # --- Search UI ---
 col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
 with col1:
@@ -65,6 +127,8 @@ with col3:
 with col4:
     days_ahead = st.slider("Search Window (Days)", min_value=7, max_value=60, value=60)
 
+st.caption("💡 Tip: Seats.aero tracks major international hubs (`DEL`, `BOM`, `BLR`, `MAA`, `HYD`). Smaller airports like `CCU` may have limited or no cached coverage depending on the airline program.")
+
 start_date_str = date.today().isoformat()
 end_date_str = (date.today() + timedelta(days=days_ahead)).isoformat()
 
@@ -75,7 +139,6 @@ if st.button("Search 60-Day Award Seats", type="primary"):
         http_session = requests.Session()
 
         # 1. Initialize MCP session
-        status_box.write("1️⃣ Sending `initialize` handshake...")
         code, init_res, session_id = mcp_post(
             http_session,
             "initialize",
@@ -86,52 +149,31 @@ if st.button("Search 60-Day Award Seats", type="primary"):
             },
             req_id=1,
         )
-        status_box.write(f"   • HTTP {code} | Session ID: `{session_id or 'stateless'}`")
 
-        # 2. Send required 'notifications/initialized' confirmation
-        status_box.write("2️⃣ Sending `notifications/initialized`...")
+        # 2. Confirm initialization
         mcp_post(http_session, "notifications/initialized", session_id=session_id, req_id=None)
 
-        # 3. List available MCP tools & inspect schema
-        status_box.write("3️⃣ Fetching available search tools (`tools/list`)...")
+        # 3. Fetch tools
         code, tools_res, session_id = mcp_post(
             http_session, "tools/list", params={}, session_id=session_id, req_id=2
         )
         tools = tools_res.get("result", {}).get("tools", [])
 
         if not tools:
-            status_box.update(label="MCP server did not return any tools", state="error")
-            st.error("Could not load tools from Seats.aero. Raw response below:")
+            status_box.update(label="No tools returned by server", state="error")
             st.json(tools_res)
             st.stop()
 
-        tool_names = [t.get("name") for t in tools]
-        status_box.write(f"   • Discovered tools: `{', '.join(tool_names)}`")
-
-        # Pick the primary flight search tool dynamically
-        search_tool = next(
-            (t for t in tools if any(k in t["name"].lower() for k in ["flight", "search", "avail", "award"])),
-            tools[0],
-        )
+        # 4. Pick the route search tool (ignoring flight-reference lookup tools)
+        search_tool = pick_route_search_tool(tools)
         tool_name = search_tool["name"]
-        schema_props = search_tool.get("inputSchema", {}).get("properties", {})
+        args = build_tool_arguments(search_tool, origin, destination, cabin, start_date_str, end_date_str)
 
-        # Map our inputs to the exact parameter names expected by the tool's schema
-        args = {}
-        for prop_name in schema_props:
-            p_low = prop_name.lower()
-            if "origin" in p_low and "region" not in p_low:
-                args[prop_name] = origin
-            elif ("dest" in p_low or "arrival" in p_low) and "region" not in p_low:
-                args[prop_name] = destination
-            elif "start" in p_low and "date" in p_low:
-                args[prop_name] = start_date_str
-            elif "end" in p_low and "date" in p_low:
-                args[prop_name] = end_date_str
-            elif "cabin" in p_low and cabin != "Any":
-                args[prop_name] = cabin
+        status_box.write(f"Available tools: `{[t.get('name') for t in tools]}`")
+        status_box.write(f"Selected route search tool: **`{tool_name}`**")
+        status_box.write(f"Sending arguments: `{json.dumps(args)}`")
 
-        status_box.write(f"4️⃣ Calling `{tool_name}` with `{json.dumps(args)}`...")
+        # 5. Call the route search tool
         code, call_res, _ = mcp_post(
             http_session,
             "tools/call",
@@ -141,44 +183,43 @@ if st.button("Search 60-Day Award Seats", type="primary"):
         )
         status_box.update(label="Search complete!", state="complete", expanded=False)
 
-        # 4. Extract and display the results
         result_block = call_res.get("result", {})
         content_items = result_block.get("content", [])
 
         if call_res.get("error"):
             st.error(f"MCP Server Error: {call_res['error']}")
 
-        rendered_any = False
         for item in content_items:
             text_val = item.get("text", "")
             if not text_val:
                 continue
-            rendered_any = True
-            # Try parsing as JSON in case the tool returns structured flight objects
             try:
                 parsed_json = json.loads(text_val)
-                if isinstance(parsed_json, list) and len(parsed_json) > 0:
-                    st.subheader(f"Found {len(parsed_json)} Award Results ({origin} → {destination})")
-                    st.dataframe(parsed_json, use_container_width=True)
-                elif isinstance(parsed_json, dict) and "data" in parsed_json and isinstance(parsed_json["data"], list):
+                if isinstance(parsed_json, list):
+                    if parsed_json:
+                        st.subheader(f"Found {len(parsed_json)} Award Flights ({origin} → {destination})")
+                        st.dataframe(parsed_json, use_container_width=True)
+                    else:
+                        st.warning(f"0 cached seats found for {origin} → {destination}. Try `DEL` → `SIN` or `BOM` → `LHR`.")
+                elif isinstance(parsed_json, dict) and isinstance(parsed_json.get("data"), list):
                     rows = parsed_json["data"]
                     if rows:
-                        st.subheader(f"Found {len(rows)} Award Results ({origin} → {destination})")
+                        st.subheader(f"Found {len(rows)} Award Flights ({origin} → {destination})")
                         st.dataframe(rows, use_container_width=True)
                     else:
-                        st.warning(f"No cached reward seats found between {origin} and {destination} for {start_date_str} to {end_date_str}. Try a major hub route like JFK -> LHR or SIN -> NRT to verify.")
+                        st.warning(f"0 cached seats found for {origin} → {destination}. Try `DEL` → `SIN` or `BOM` → `LHR`.")
                 else:
                     st.json(parsed_json)
             except json.JSONDecodeError:
-                # If the MCP server already formatted it as Markdown/text, render it directly
                 st.markdown(text_val)
 
-        if not rendered_any:
-            st.warning("The query succeeded, but no text content was returned. Inspect the raw response below:")
-
-        with st.expander("🔍 Inspect Raw MCP Response & Tool Schema"):
-            st.write("**Selected Tool Schema:**")
+        with st.expander("🔍 Inspect All MCP Tools & Raw Response"):
+            st.write("**Selected Tool & Schema:**")
             st.json(search_tool)
+            st.write("**Arguments Sent:**")
+            st.json(args)
+            st.write("**All Tools Exposed by Server:**")
+            st.json(tools)
             st.write("**Raw `tools/call` Response:**")
             st.json(call_res)
 
