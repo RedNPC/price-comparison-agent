@@ -11,7 +11,8 @@ st.set_page_config(
 
 st.title("🏷️ Real-Time Price Comparison Agent")
 st.caption(
-    "Powered by Gemini 3.5 Flash-Lite + Live Web Search (Zero-Cost Free Tier)"
+    "Powered by Gemini 3.5 Flash-Lite + Targeted Retail Search (Zero-Cost Free"
+    " Tier)"
 )
 
 api_key = (
@@ -21,7 +22,7 @@ api_key = (
 )
 
 product = st.text_input(
-    "Enter product name (e.g., Xbox Series X 1TB, Sony WH-1000XM5):"
+    "Enter product name (e.g., PlayStation 5, Xbox Series X, Sony WH-1000XM5):"
 )
 
 if st.button("Find Lowest Price", type="primary"):
@@ -30,43 +31,53 @@ if st.button("Find Lowest Price", type="primary"):
   elif not product.strip():
     st.warning("Please enter a product name.")
   else:
-    with st.spinner("Agent is querying live web listings..."):
+    with st.spinner(
+        "Agent is scanning Amazon, Flipkart, and retail price indexes..."
+    ):
       try:
-        # Step 1: Query live search snippets across Indian retailers
-        search_query = f"{product} price in India Amazon.in Flipkart Croma"
+        # Step 1: Run 3 focused searches targeting exact rupee prices
+        search_results = []
+        queries = [
+            f'"{product}" "₹" site:amazon.in',
+            f'"{product}" "₹" site:flipkart.com',
+            f'"{product}" price India "₹" Croma OR Reliance',
+        ]
+
         with DDGS() as ddgs:
-          raw_results = list(
-              ddgs.text(search_query, region="in-en", max_results=8)
-          )
+          for q in queries:
+            try:
+              results = list(ddgs.text(q, region="in-en", max_results=4))
+              search_results.extend(results)
+            except Exception:
+              continue
 
         search_context = "\n\n".join([
             f"Title: {r.get('title')}\nSnippet: {r.get('body')}\nURL:"
             f" {r.get('href')}"
-            for r in raw_results
+            for r in search_results
         ])
 
         if not search_context.strip():
-          st.warning("No search results found. Try a different product name.")
+          st.warning("No pricing data found. Please refine the product name.")
         else:
           client = genai.Client(api_key=api_key)
 
           prompt = f"""
-                    You are a procurement and price intelligence agent.
-                    Below are live search results from Indian retail sites for the product: "{product}".
+                    You are a procurement price analyst.
+                    The user wants to find the best purchase price in India for: "{product}".
 
-                    LIVE SEARCH RESULTS:
+                    RAW RETAIL SEARCH DATA:
                     {search_context}
 
-                    INSTRUCTIONS:
-                    1. Extract the current standard face-value listed price (in INR / ₹) on Amazon.in, Flipkart, and other retailers. Ignore card/bank discounts.
-                    2. If the user query is broad (e.g., "PlayStation 5" or "Xbox"), identify the separate variants (e.g., Disc vs Digital Edition) and group them so you do not compare different models.
-                    3. Calculate the variance/savings between the highest and lowest price found.
-                    4. Output a clean Markdown table:
-                       | Variant / Model | Retailer | Listed Price (₹) | In Stock? | Source Link |
-                    5. Provide a direct, concise purchase recommendation highlighting the lowest-cost option.
+                    MANDATORY INSTRUCTIONS:
+                    1. Scrutinize the snippets for exact numerical prices in INR (₹ or Rs.). NEVER output "Check Site" as the price if any numeric figure is present in the text.
+                    2. If you see specific prices (e.g., ₹44,990, ₹49,990, ₹54,990, ₹64,990, ₹69,990), match each price to its retailer and exact model variant (e.g., Slim Disc vs. Slim Digital).
+                    3. If an exact platform's live price is missing from the snippets, output the standard Indian market price or last recorded listing with an asterisk (*).
+                    4. Output a clean Markdown comparison table:
+                       | Product / Variant | Retailer | Listed Price (₹) | Status / Stock | Direct Link |
+                    5. Provide a direct verdict: Which retailer offers the lowest listed price right now, and what is the exact cash variance/saving compared to other stores?
                     """
 
-          # Step 2: Fallback handling across available lightweight models
           models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
           response = None
 
@@ -88,10 +99,7 @@ if st.button("Find Lowest Price", type="primary"):
           if response and response.text:
             st.markdown(response.text)
           else:
-            st.error(
-                "Google servers are experiencing peak congestion. Please try"
-                " again in a few moments."
-            )
+            st.error("Service busy. Please retry in a few moments.")
 
       except Exception as e:
         st.error(f"Error fetching prices: {e}")
