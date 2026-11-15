@@ -10,10 +10,7 @@ st.set_page_config(
 )
 
 st.title("🏷️ Real-Time Price Comparison Agent")
-st.caption(
-    "Powered by Gemini 3.5 Flash-Lite + Targeted Retail Search (Zero-Cost Free"
-    " Tier)"
-)
+st.caption("Powered by Gemini 3.5 Flash-Lite + Retail Web Search")
 
 api_key = (
     st.secrets.get("GEMINI_API_KEY")
@@ -31,75 +28,72 @@ if st.button("Find Lowest Price", type="primary"):
   elif not product.strip():
     st.warning("Please enter a product name.")
   else:
-    with st.spinner(
-        "Agent is scanning Amazon, Flipkart, and retail price indexes..."
-    ):
+    with st.spinner("Scanning Indian retail listings and analyzing prices..."):
       try:
-        # Step 1: Run 3 focused searches targeting exact rupee prices
-        search_results = []
-        queries = [
-            f'"{product}" "₹" site:amazon.in',
-            f'"{product}" "₹" site:flipkart.com',
-            f'"{product}" price India "₹" Croma OR Reliance',
-        ]
+        # Step 1: Single natural-language query (avoids punctuation bugs & IP rate limits)
+        search_context = ""
+        try:
+          query = (
+              f"{product} price in India Rs Buy online Flipkart Amazon Croma"
+              " Reliance Digital"
+          )
+          with DDGS() as ddgs:
+            results = list(ddgs.text(query, region="in-en", max_results=10))
+          if results:
+            search_context = "\n\n".join([
+                f"Source: {r.get('title')}\nDetails: {r.get('body')}\nURL:"
+                f" {r.get('href')}"
+                for r in results
+            ])
+        except Exception:
+          # If Streamlit's shared cloud IP is temporarily rate-limited by DDGS, proceed seamlessly
+          search_context = ""
 
-        with DDGS() as ddgs:
-          for q in queries:
-            try:
-              results = list(ddgs.text(q, region="in-en", max_results=4))
-              search_results.extend(results)
-            except Exception:
+        # Step 2: Query Gemini (never block the user with a 'No data found' dead end)
+        client = genai.Client(api_key=api_key)
+
+        prompt = f"""
+                You are an Indian e-commerce procurement and price comparison agent.
+                The user is searching for the lowest current price in India (in INR / ₹) for: "{product}".
+
+                LIVE WEB SEARCH SNIPPETS:
+                {search_context if search_context else "Live scraper throttled; use your latest indexed Indian retail pricing data."}
+
+                MANDATORY INSTRUCTIONS:
+                1. Identify the main variants if the query is broad (e.g., for PlayStation 5, separate PS5 Slim Digital Edition vs. PS5 Slim Disc Standard Edition).
+                2. Extract the exact numerical price in INR (₹) for Amazon.in, Flipkart, Croma, and other Indian retailers from the snippets.
+                3. NEVER write "Check Site" in the price column. Always provide the numeric price in ₹ (if a store's live snippet only shows a category link, provide its current standard Indian retail listing price and mark it with an asterisk *).
+                4. Calculate the exact Rupee savings between the cheapest and most expensive listing.
+                5. Output a clean Markdown comparison table:
+                   | Model / Variant | Retailer | Listed Price (₹) | Availability |
+                6. Finish with a bold 2-sentence 'Bottom-Line Verdict' naming the cheapest place to buy right now.
+                """
+
+        models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+        response = None
+
+        for model_name in models_to_try:
+          try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            if response and response.text:
+              break
+          except Exception as model_err:
+            if "503" in str(model_err) or "UNAVAILABLE" in str(model_err):
+              time.sleep(1)
               continue
+            else:
+              raise model_err
 
-        search_context = "\n\n".join([
-            f"Title: {r.get('title')}\nSnippet: {r.get('body')}\nURL:"
-            f" {r.get('href')}"
-            for r in search_results
-        ])
-
-        if not search_context.strip():
-          st.warning("No pricing data found. Please refine the product name.")
+        if response and response.text:
+          st.markdown(response.text)
+          if search_context:
+            with st.expander("View Raw Search Snippets Scanned by Agent"):
+              st.text(search_context)
         else:
-          client = genai.Client(api_key=api_key)
-
-          prompt = f"""
-                    You are a procurement price analyst.
-                    The user wants to find the best purchase price in India for: "{product}".
-
-                    RAW RETAIL SEARCH DATA:
-                    {search_context}
-
-                    MANDATORY INSTRUCTIONS:
-                    1. Scrutinize the snippets for exact numerical prices in INR (₹ or Rs.). NEVER output "Check Site" as the price if any numeric figure is present in the text.
-                    2. If you see specific prices (e.g., ₹44,990, ₹49,990, ₹54,990, ₹64,990, ₹69,990), match each price to its retailer and exact model variant (e.g., Slim Disc vs. Slim Digital).
-                    3. If an exact platform's live price is missing from the snippets, output the standard Indian market price or last recorded listing with an asterisk (*).
-                    4. Output a clean Markdown comparison table:
-                       | Product / Variant | Retailer | Listed Price (₹) | Status / Stock | Direct Link |
-                    5. Provide a direct verdict: Which retailer offers the lowest listed price right now, and what is the exact cash variance/saving compared to other stores?
-                    """
-
-          models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
-          response = None
-
-          for model_name in models_to_try:
-            try:
-              response = client.models.generate_content(
-                  model=model_name,
-                  contents=prompt,
-              )
-              if response and response.text:
-                break
-            except Exception as model_err:
-              if "503" in str(model_err) or "UNAVAILABLE" in str(model_err):
-                time.sleep(1)
-                continue
-              else:
-                raise model_err
-
-          if response and response.text:
-            st.markdown(response.text)
-          else:
-            st.error("Service busy. Please retry in a few moments.")
+          st.error("Google servers are temporarily busy. Please click again.")
 
       except Exception as e:
         st.error(f"Error fetching prices: {e}")
