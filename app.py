@@ -1,164 +1,132 @@
-import time
-from google import genai
+import json
+from datetime import date, timedelta
 import requests
 import streamlit as st
+from google import genai
 
-st.set_page_config(
-    page_title="AI Travel Hacking Toolkit", page_icon="✈️", layout="wide"
-)
+st.set_page_config(page_title="60-Day Reward Seat Finder", page_icon="✈️", layout="wide")
+st.title("✈️ 60-Day Reward Seat Availability")
+st.caption("Powered by the public Seats.aero MCP endpoint — no points calculator, just open award seats.")
 
-st.title("✈️ AI Travel Hacking & Points Optimizer")
-st.caption(
-    "Web UI powered by borski/travel-hacking-toolkit live GitHub data + Gemini"
-)
+MCP_URL = "https://seats.aero/mcp"
 
-gemini_key = (
-    st.secrets.get("GEMINI_API_KEY")
-    if "GEMINI_API_KEY" in st.secrets
-    else st.sidebar.text_input("Gemini API Key", type="password")
-)
-serper_key = (
-    st.secrets.get("SERPER_API_KEY")
-    if "SERPER_API_KEY" in st.secrets
-    else st.sidebar.text_input("Serper API Key (Optional)", type="password")
-)
+# 1. Load Gemini API Key (from Streamlit Secrets or sidebar)
+api_key = st.secrets.get("GEMINI_API_KEY", "")
+if not api_key:
+    api_key = st.sidebar.text_input("Gemini API Key", type="password")
 
-BORSKI_RAW_BASE = (
-    "https://raw.githubusercontent.com/borski/travel-hacking-toolkit/main"
-)
+def parse_mcp_response(resp):
+    """Handles both standard JSON and SSE (text/event-stream) MCP responses."""
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/event-stream" in content_type:
+        for line in resp.text.splitlines():
+            if line.startswith("data:"):
+                data_str = line[len("data:"):].strip()
+                if data_str:
+                    return json.loads(data_str)
+    return resp.json()
 
+def mcp_request(method, params=None, session_id=None, req_id=1):
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
 
-# Pulls live JSON databases directly from borski/travel-hacking-toolkit on GitHub
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_toolkit_data():
-  files = {
-      "sweet_spots": f"{BORSKI_RAW_BASE}/data/sweet-spots.json",
-      "transfer_partners": f"{BORSKI_RAW_BASE}/data/transfer-partners.json",
-      "points_valuations": f"{BORSKI_RAW_BASE}/data/points-valuations.json",
-      "alliances": f"{BORSKI_RAW_BASE}/data/alliances.json",
-  }
-  loaded = {}
-  for name, url in files.items():
-    try:
-      r = requests.get(url, timeout=10)
-      if r.status_code == 200:
-        loaded[name] = r.text[:12000]  # Keep within fast token budget
-    except Exception:
-      loaded[name] = "Unavailable"
-  return loaded
+    payload = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    if params is not None:
+        payload["params"] = params
 
+    resp = requests.post(MCP_URL, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    new_session_id = resp.headers.get("Mcp-Session-Id", session_id)
+    return parse_mcp_response(resp), new_session_id
 
-@st.cache_data(ttl=43200, show_spinner=False)
-def fetch_live_flight_baseline(origin, dest, dates, api_key):
-  if not api_key:
-    return "No Serper key provided; estimate standard cash fares."
-  try:
-    res = requests.post(
-        "https://google.serper.dev/search",
-        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
-        json={
-            "q": (
-                f"flights from {origin} to {dest} {dates} price Google Flights"
-                " Skyscanner"
-            ),
-            "num": 8,
-        },
-        timeout=10,
-    ).json()
-    return "\n".join([
-        f"{i.get('title')}: {i.get('snippet')}" for i in res.get("organic", [])
-    ])
-  except Exception:
-    return ""
+def fetch_60_day_availability(user_prompt, client):
+    # Step A: Initialize keyless MCP session
+    init_params = {
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "streamlit-award-finder", "version": "1.0.0"},
+    }
+    _, session_id = mcp_request("initialize", init_params, req_id=1)
 
+    # Step B: Fetch available MCP tools so arguments always match the live schema
+    tools_res, session_id = mcp_request("tools/list", {}, session_id=session_id, req_id=2)
+    tools = tools_res.get("result", {}).get("tools", [])
 
-col1, col2, col3, col4 = st.columns(4)
+    today_str = date.today().isoformat()
+    max_date_str = (date.today() + timedelta(days=60)).isoformat()
+
+    # Step C: Have Gemini map the search into the exact MCP tool call
+    planner_prompt = f"""
+    Today is {today_str}. The free public tier covers departures from {today_str} to {max_date_str} (60 days).
+    Available MCP tools:
+    {json.dumps(tools)}
+
+    User request: "{user_prompt}"
+
+    Return ONLY a raw JSON object with keys "name" (the exact tool name for searching cached award flights)
+    and "arguments" (matching that tool's inputSchema). Do not wrap in markdown fences.
+    """
+    plan_resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=planner_prompt,
+    )
+    cleaned_json = plan_resp.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    tool_call = json.loads(cleaned_json)
+
+    # Step D: Execute the MCP tool call against Seats.aero
+    call_res, _ = mcp_request(
+        "tools/call",
+        {"name": tool_call["name"], "arguments": tool_call["arguments"]},
+        session_id=session_id,
+        req_id=3,
+    )
+    return call_res
+
+# --- UI Layout ---
+col1, col2, col3 = st.columns([2, 2, 2])
 with col1:
-  origin = st.text_input(
-      "Origin (Airport/City)", placeholder="e.g., DEL, CCU, SFO"
-  )
+    origin = st.text_input("Origin Airport(s) (IATA)", value="DEL, BOM")
 with col2:
-  dest = st.text_input(
-      "Destination (Airport/City)", placeholder="e.g., NRT, LHR, CDG"
-  )
+    destination = st.text_input("Destination Airport(s) (IATA)", value="SIN, LHR")
 with col3:
-  dates = st.text_input("Dates / Month", placeholder="e.g., Dec 2026")
-with col4:
-  cabin = st.selectbox(
-      "Cabin Class", ["Economy", "Premium Economy", "Business", "First"]
-  )
+    cabin = st.selectbox("Preferred Cabin", ["Any", "economy", "premium", "business", "first"])
 
-points_info = st.text_input(
-    "Your Points / Miles / Cards (Optional — supports US & Indian programs)",
-    placeholder=(
-        "e.g., 100k Chase UR, 80k Amex MR, HDFC Infinia, Axis Atlas, or leave"
-        " blank for best sweet spots"
-    ),
+custom_notes = st.text_input(
+    "Optional date window or filter (within the next 60 days)",
+    placeholder="e.g., anytime in December, at least 2 seats",
 )
 
-if st.button("Run Travel Hacking Analysis", type="primary"):
-  if not gemini_key:
-    st.error("Please provide a Gemini API Key in Secrets or the sidebar.")
-  elif not origin.strip() or not dest.strip():
-    st.warning("Please enter both an Origin and a Destination.")
-  else:
-    with st.spinner(
-        "Loading borski/travel-hacking-toolkit databases & calculating optimal"
-        " redemptions..."
-    ):
-      toolkit_data = load_toolkit_data()
-      live_flights = fetch_live_flight_baseline(
-          origin, dest, dates, serper_key
-      )
+if st.button("Search 60-Day Award Seats", type="primary"):
+    if not api_key:
+        st.error("Please add your GEMINI_API_KEY in Streamlit Secrets or the sidebar.")
+    else:
+        client = genai.Client(api_key=api_key)
+        query_text = f"Find award seat availability from {origin} to {destination} in {cabin} cabin within the next 60 days. {custom_notes}"
+        
+        with st.spinner("Querying live 60-day inventory from Seats.aero MCP..."):
+            try:
+                raw_mcp_data = fetch_60_day_availability(query_text, client)
+                
+                format_prompt = f"""
+                Format the following raw Seats.aero MCP response into a clean Markdown table of available reward seats.
+                Include ONLY: Date, Route, Operating Carrier / Program, Cabin, Seats Available, and Mileage Cost + Taxes (if listed).
+                Do NOT include points valuation formulas, CPP calculations, or transfer partner advice.
 
-      prompt = f"""
-            You are the AI Travel Hacker Agent powered by `borski/travel-hacking-toolkit`.
-            Plan and optimize this trip using the official toolkit reference data below:
-            - Route: {origin} to {dest}
-            - Dates: {dates or "Flexible"}
-            - Cabin: {cabin}
-            - User's Points/Cards: {points_info or "Show best overall award sweet spots & transfer paths"}
-
-            LIVE CASH FLIGHT BASELINE:
-            {live_flights}
-
-            TOOLKIT REFERENCE DATA (FROM GITHUB):
-            1. SWEET SPOTS DB: {toolkit_data.get('sweet_spots', '')}
-            2. TRANSFER PARTNERS DB: {toolkit_data.get('transfer_partners', '')}
-            3. POINTS VALUATIONS (CPP FLOORS): {toolkit_data.get('points_valuations', '')}
-            4. ALLIANCES DB: {toolkit_data.get('alliances', '')}
-
-            MANDATORY WORKFLOW (FROM BORSKI TRIP-PLANNER & TRIP-CALCULATOR SKILLS):
-            1. **Trip Cost & Strategy Matrix**: Output a Markdown table comparing:
-               | Booking Strategy | Program / Airline Alliance | Est. Miles / Points Needed | Est. Cash / Taxes | Effective Value (CPP) | Verdict |
-            2. **Award Sweet Spots & Transfer Paths**: Highlight the best partner award sweet spots for this route (e.g., Star Alliance, Oneworld, SkyTeam) and which credit card currencies (US cards from the JSON, plus Indian cards like Amex/HDFC/Axis if relevant to the route) transfer to them.
-            3. **Cash vs. Points Math**: Using the formula `CPP = (Cash Price - Award Taxes) / Points * 100`, state whether the user should pay cash or burn points compared against the floor valuations.
-            4. **Actionable Booking Checklist**: Give a 3-step checklist (which site to search availability on first, hold rules, and transfer warnings).
-            """
-
-      client = genai.Client(api_key=gemini_key)
-      models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
-      response = None
-
-      for model_name in models_to_try:
-        try:
-          response = client.models.generate_content(
-              model=model_name, contents=prompt
-          )
-          if response and response.text:
-            break
-        except Exception as err:
-          if "503" in str(err) or "UNAVAILABLE" in str(err):
-            time.sleep(1.5)
-            continue
-          raise err
-
-      if response and response.text:
-        st.markdown(response.text)
-        with st.expander(
-            "📂 View Live JSON Data Loaded from borski/travel-hacking-toolkit"
-        ):
-          st.write("Successfully synced directly from GitHub `main` branch:")
-          st.json({k: f"{len(v)} chars loaded" for k, v in toolkit_data.items()})
-      else:
-        st.error("Gemini servers are temporarily busy. Please try again.")
+                Raw data:
+                {json.dumps(raw_mcp_data)}
+                """
+                final_output = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=format_prompt,
+                )
+                st.markdown(final_output.text)
+                
+                with st.expander("View Raw MCP JSON Response"):
+                    st.json(raw_mcp_data)
+            except Exception as e:
+                st.error(f"Error fetching availability: {e}")
+    
