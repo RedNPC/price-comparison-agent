@@ -54,65 +54,40 @@ def mcp_post(http_session, method, params=None, session_id=None, req_id=None):
     )
     return resp.status_code, parse_mcp_response(resp), new_session_id
 
-def pick_award_search_tool(tools):
-    """Selects the cached flight availability tool (and skips get_routes, get_trips, etc.)."""
-    scored_tools = []
-    for t in tools:
-        name = t.get("name", "").lower()
-        schema = t.get("inputSchema", {})
-        props = {k.lower(): v for k, v in schema.get("properties", {}).items()}
-        required = [r.lower() for r in schema.get("required", [])]
-
-        # 1. Exclude route-list, destination-list, trip-ID, alert, and live-search tools
-        if any(skip in name for skip in ["route", "destination", "trip", "alert", "live", "refresh", "bulk"]):
-            continue
-        if any(bad in r for r in required for bad in ["id", "ref", "trip"]):
-            continue
-
-        # 2. Score based on having origin + destination + date/cabin parameters
-        score = 0
-        if any("origin" in p or "from" in p for p in props):
-            score += 5
-        if any("dest" in p or "to" in p for p in props):
-            score += 5
-        if any("date" in p for p in props):
-            score += 10  # Only the actual flight availability search has date filters!
-        if any("cabin" in p for p in props):
-            score += 5
-        if any(k in name for k in ["cached", "search", "flight", "avail"]):
-            score += 5
-
-        scored_tools.append((score, t))
-
-    scored_tools.sort(key=lambda x: x[0], reverse=True)
-    return scored_tools[0][1] if scored_tools else tools[0]
-
 def build_tool_arguments(tool, origin, destination, cabin, start_date_str, end_date_str):
-    """Maps user inputs onto the exact property names and types defined in the tool's JSON schema."""
+    """Maps inputs using exact property names and never puts strings into integer/number fields."""
     schema = tool.get("inputSchema", {})
     props = schema.get("properties", {})
     args = {}
 
+    ORIGIN_KEYS = {"origin", "origins", "origin_airport", "origin_airports", "from_airport", "departure_airport"}
+    DEST_KEYS = {"destination", "destinations", "destination_airport", "destination_airports", "to_airport", "arrival_airport"}
+    START_DATE_KEYS = {"start_date", "startdate", "date_from", "from_date", "departure_date", "date"}
+    END_DATE_KEYS = {"end_date", "enddate", "date_to", "to_date"}
+    CABIN_KEYS = {"cabin", "cabins", "cabin_class"}  # Strictly excludes min_cabin_pct!
+
     for prop_name, prop_def in props.items():
         p_low = prop_name.lower()
         prop_type = prop_def.get("type", "string")
+
+        # Never populate integer, number, or boolean fields with string inputs
+        if prop_type in ("integer", "number", "boolean"):
+            continue
 
         def format_val(val):
             if prop_type == "array":
                 return [x.strip() for x in val.split(",") if x.strip()]
             return val
 
-        if any(k in p_low for k in ["origin", "from_airport", "departure_airport", "origins"]) and "region" not in p_low:
+        if p_low in ORIGIN_KEYS:
             args[prop_name] = format_val(origin)
-        elif any(k in p_low for k in ["dest", "to_airport", "arrival_airport", "destinations"]) and "region" not in p_low:
+        elif p_low in DEST_KEYS:
             args[prop_name] = format_val(destination)
-        elif any(k in p_low for k in ["start_date", "startdate", "date_from", "from_date", "departure_date", "start"]):
+        elif p_low in START_DATE_KEYS:
             args[prop_name] = start_date_str
-        elif any(k in p_low for k in ["end_date", "enddate", "date_to", "to_date", "end"]):
+        elif p_low in END_DATE_KEYS:
             args[prop_name] = end_date_str
-        elif p_low == "date":
-            args[prop_name] = start_date_str
-        elif "cabin" in p_low and cabin != "Any":
+        elif p_low in CABIN_KEYS and cabin != "Any":
             args[prop_name] = format_val(cabin)
 
     return args
@@ -120,7 +95,6 @@ def build_tool_arguments(tool, origin, destination, cabin, start_date_str, end_d
 def extract_json_rows(text_val):
     """Extracts JSON objects whether returned as a JSON array, dict, or line-by-line JSON objects."""
     rows = []
-    # Try parsing the whole block first
     try:
         parsed = json.loads(text_val)
         if isinstance(parsed, list):
@@ -132,7 +106,6 @@ def extract_json_rows(text_val):
     except json.JSONDecodeError:
         pass
 
-    # Fallback: Seats.aero MCP formats output with a text header followed by one JSON object per line
     for line in text_val.splitlines():
         line = line.strip()
         if line.startswith("{") and line.endswith("}"):
@@ -179,7 +152,7 @@ if st.button("Search 60-Day Award Seats", type="primary"):
         # 2. Confirm initialization
         mcp_post(http_session, "notifications/initialized", session_id=session_id, req_id=None)
 
-        # 3. Fetch tools
+        # 3. Fetch tools and pick get_flights directly
         _, tools_res, session_id = mcp_post(
             http_session, "tools/list", params={}, session_id=session_id, req_id=2
         )
@@ -189,14 +162,13 @@ if st.button("Search 60-Day Award Seats", type="primary"):
             status_box.update(label="No tools returned by server", state="error")
             st.stop()
 
-        # 4. Pick the dated flight availability search tool (skipping get_routes)
-        search_tool = pick_award_search_tool(tools)
+        search_tool = next((t for t in tools if t.get("name") == "get_flights"), tools[0])
         tool_name = search_tool["name"]
         args = build_tool_arguments(search_tool, origin, destination, cabin, start_date_str, end_date_str)
 
-        status_box.write(f"Using tool: **`{tool_name}`** | Params: `{json.dumps(args)}`")
+        status_box.write(f"Calling **`{tool_name}`** with `{json.dumps(args)}`")
 
-        # 5. Call the award search tool
+        # 4. Call get_flights
         _, call_res, _ = mcp_post(
             http_session,
             "tools/call",
@@ -229,16 +201,14 @@ if st.button("Search 60-Day Award Seats", type="primary"):
             st.warning(f"No reward seats returned for {origin} → {destination} between {start_date_str} and {end_date_str}.")
 
         with st.expander("🔍 Inspect Tool Schema & Raw MCP Output"):
-            st.write("**Selected Tool & Schema:**")
-            st.json(search_tool)
             st.write("**Arguments Sent:**")
             st.json(args)
-            st.write("**All Tools Exposed by Server:**")
-            st.json([t.get("name") for t in tools])
+            st.write("**`get_flights` Schema:**")
+            st.json(search_tool)
             st.write("**Raw `tools/call` Response:**")
             st.json(call_res)
 
     except Exception as e:
         status_box.update(label="Connection failed", state="error", expanded=True)
         st.exception(e)
-        
+
