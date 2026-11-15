@@ -1,6 +1,6 @@
 import time
-from ddgs import DDGS
 from google import genai
+import requests
 import streamlit as st
 
 st.set_page_config(
@@ -10,94 +10,133 @@ st.set_page_config(
 )
 
 st.title("🏷️ Real-Time Price Comparison Agent")
-st.caption("Powered by Gemini 3.5 Flash-Lite + Retail Web Search")
+st.caption("Powered by Live Google Shopping India Feed + Gemini 3.5 Flash-Lite")
 
-api_key = (
+gemini_key = (
     st.secrets.get("GEMINI_API_KEY")
     if "GEMINI_API_KEY" in st.secrets
-    else st.sidebar.text_input("Enter Gemini API Key", type="password")
+    else st.sidebar.text_input("Gemini API Key", type="password")
+)
+serper_key = (
+    st.secrets.get("SERPER_API_KEY")
+    if "SERPER_API_KEY" in st.secrets
+    else st.sidebar.text_input("Serper API Key", type="password")
 )
 
 product = st.text_input(
-    "Enter product name (e.g., PlayStation 5, Xbox Series X, Sony WH-1000XM5):"
+    "Enter product name (e.g., PlayStation 5 Slim, Xbox Series X, Sony"
+    " WH-1000XM5):"
 )
 
 if st.button("Find Lowest Price", type="primary"):
-  if not api_key:
-    st.error("Please provide a Gemini API Key to run the agent.")
+  if not gemini_key or not serper_key:
+    st.error("Please ensure both GEMINI_API_KEY and SERPER_API_KEY are set.")
   elif not product.strip():
     st.warning("Please enter a product name.")
   else:
-    with st.spinner("Scanning Indian retail listings and analyzing prices..."):
+    with st.spinner(
+        "Pulling verified listings from Google Shopping India & Retailers..."
+    ):
       try:
-        search_context = ""
-        try:
-          query = (
-              f"{product} price in India Rs Buy online Flipkart Amazon Croma"
-              " Reliance Digital"
+        headers = {
+            "X-API-KEY": serper_key,
+            "Content-Type": "application/json",
+        }
+
+        # 1. Fetch live Google Shopping India listings (verified prices & direct merchant links)
+        shop_res = requests.post(
+            "https://google.serper.dev/shopping",
+            headers=headers,
+            json={"q": product, "gl": "in", "hl": "en", "num": 10},
+            timeout=10,
+        ).json()
+
+        # 2. Fetch direct product pages from Amazon.in, Flipkart, Croma, Reliance Digital
+        web_res = requests.post(
+            "https://google.serper.dev/search",
+            headers=headers,
+            json={
+                "q": (
+                    f"{product} buy online India (site:amazon.in OR"
+                    " site:flipkart.com OR site:croma.com OR"
+                    " site:reliancedigital.in)"
+                ),
+                "gl": "in",
+                "hl": "en",
+                "num": 10,
+            },
+            timeout=10,
+        ).json()
+
+        raw_records = []
+
+        for item in shop_res.get("shopping", []):
+          raw_records.append(
+              f"[GOOGLE SHOPPING] Title: {item.get('title')} | Store:"
+              f" {item.get('source')} | Exact Price: {item.get('price')} |"
+              f" Direct URL: {item.get('link')}"
           )
-          with DDGS() as ddgs:
-            results = list(ddgs.text(query, region="in-en", max_results=10))
-          if results:
-            search_context = "\n\n".join([
-                f"Source: {r.get('title')}\nDetails: {r.get('body')}\nURL:"
-                f" {r.get('href')}"
-                for r in results
-            ])
-        except Exception:
-          search_context = ""
 
-        client = genai.Client(api_key=api_key)
+        for item in web_res.get("organic", []):
+          price_info = item.get("price", "") or item.get("snippet", "")
+          raw_records.append(
+              f"[DIRECT RETAILER PAGE] Title: {item.get('title')} | Snippet/Price:"
+              f" {price_info} | Direct Product URL: {item.get('link')}"
+          )
 
-        prompt = f"""
-                You are an Indian e-commerce procurement and price comparison agent.
-                The user is searching for the lowest current price in India (in INR / ₹) for: "{product}".
+        search_context = "\n".join(raw_records)
 
-                LIVE WEB SEARCH SNIPPETS:
-                {search_context if search_context else "Live scraper throttled; use your latest indexed Indian retail pricing data."}
-
-                MANDATORY INSTRUCTIONS:
-                1. Identify the main variants if the query is broad (e.g., for PlayStation 5, separate PS5 Slim Digital Edition vs. PS5 Slim Disc Standard Edition).
-                2. Extract the exact numerical price in INR (₹) for Amazon.in, Flipkart, Croma, and other Indian retailers from the snippets.
-                3. NEVER write "Check Site" in the price column. Always provide the numeric price in ₹ (if a store's live snippet only shows a category link, provide its current standard Indian retail listing price and mark it with an asterisk *).
-                4. Output a clean Markdown comparison table with 5 columns:
-                   | Model / Variant | Retailer | Listed Price (₹) | Availability | Store Link |
-                5. For the 'Store Link' column, format every entry as a clickable Markdown link like [Buy on Amazon](URL):
-                   - If a matching URL is present in the LIVE WEB SEARCH SNIPPETS above, use that exact URL.
-                   - If no exact URL is in the snippets for that store, construct a working search link by replacing spaces in the model name with '+' using these exact templates:
-                     * Amazon.in: https://www.amazon.in/s?k=MODEL+NAME
-                     * Flipkart: https://www.flipkart.com/search?q=MODEL+NAME
-                     * Croma: https://www.croma.com/searchB?q=MODEL+NAME
-                     * Reliance Digital: https://www.reliancedigital.in/search?q=MODEL+NAME
-                   - Never invent fake product URLs.
-                6. Finish with a bold 2-sentence 'Bottom-Line Verdict' naming the cheapest place to buy right now and the exact Rupee savings.
-                """
-
-        models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
-        response = None
-
-        for model_name in models_to_try:
-          try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            if response and response.text:
-              break
-          except Exception as model_err:
-            if "503" in str(model_err) or "UNAVAILABLE" in str(model_err):
-              time.sleep(1)
-              continue
-            else:
-              raise model_err
-
-        if response and response.text:
-          st.markdown(response.text)
-          if search_context:
-            with st.expander("View Raw Search Snippets Scanned by Agent"):
-              st.text(search_context)
+        if not search_context.strip():
+          st.error(
+              "No live listings returned from Google India. Check your Serper"
+              " API key or product spelling."
+          )
         else:
-          st.error("Google servers are temporarily busy. Please click again.")
+          client = genai.Client(api_key=gemini_key)
+
+          prompt = f"""
+                    You are a strict, audit-grade e-commerce price verification agent for India.
+                    Below is real-time data pulled directly from Google Shopping India and Indian retail product pages for: "{product}".
+
+                    VERIFIED LIVE DATA:
+                    {search_context}
+
+                    STRICT AUDIT RULES (NO EXCEPTIONS):
+                    1. ZERO HALLUCINATION: You must ONLY report prices and URLs that explicitly appear in the VERIFIED LIVE DATA above. Never guess, estimate, or pull prices from your training memory.
+                    2. FILTER OUT ACCESSORIES: Ignore cables, controllers, skins, bags, or games unless the user specifically asked for them. Only include the main product/console.
+                    3. DIRECT LINKS ONLY: In the 'Direct Product Link' column, use ONLY the exact 'Direct URL' or 'Direct Product URL' from the raw data above. NEVER construct generic search links.
+                    4. Output a clean Markdown table:
+                       | Exact Product Title | Retailer | Verified Live Price (₹) | Direct Product Link |
+                       Format the link as [View Product Page](exact_url_from_data).
+                    5. Conclude with a brief 'Verified Lowest Price' summary stating the cheapest retailer and exact Rupee difference based strictly on the table.
+                    """
+
+          models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+          response = None
+
+          for model_name in models_to_try:
+            try:
+              response = client.models.generate_content(
+                  model=model_name,
+                  contents=prompt,
+              )
+              if response and response.text:
+                break
+            except Exception as model_err:
+              if "503" in str(model_err) or "UNAVAILABLE" in str(model_err):
+                time.sleep(1)
+                continue
+              else:
+                raise model_err
+
+          if response and response.text:
+            st.markdown(response.text)
+            with st.expander(
+                "✅ Audit Trail: View Raw Google Shopping & Retailer Data"
+            ):
+              st.text(search_context)
+          else:
+            st.error("Gemini servers are temporarily busy. Please try again.")
 
       except Exception as e:
-        st.error(f"Error fetching prices: {e}")
+        st.error(f"Error fetching live data: {e}")
